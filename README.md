@@ -7,7 +7,7 @@ A lightweight, distraction-free comic and manga reader built for Windows desktop
 ## Screenshots
 
 ### Chapter Selection Dropdown (Fullscreen)
-![Chapter Selection Dropdown](screenshots/chapters_1.png)
+![Chapter Selection Dropdown](screenshots/chapters.png)
 
 ### Reading Progress Bar (Fullscreen)
 ![Reading Progress Bar](screenshots/progress.png)

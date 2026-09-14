@@ -5,6 +5,7 @@ import zipfile
 import rarfile
 import pymupdf
 import math
+import shutil
 
 if sys.platform == "win32":
     import ctypes
@@ -46,18 +47,24 @@ def configure_dwm_fullscreen(hwnd, is_fullscreen: bool):
 
 
 def setup_rar_tool():
-    app_dir = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else __file__)
-    candidates = [
-        os.path.join(app_dir, "UnRAR.exe"),
-        os.path.join(app_dir, "7z.exe"),
-        os.path.join(os.path.dirname(__file__), "UnRAR.exe"),
-        os.path.join(os.path.dirname(__file__), "7z.exe"),
-        r"C:\Program Files\7-Zip\7z.exe",
-        r"C:\Program Files (x86)\7-Zip\7z.exe",
-        r"C:\Program Files\WinRAR\UnRAR.exe",
-        r"C:\Program Files (x86)\WinRAR\UnRAR.exe",
+    # 1. Inspect PATH first to prevent running unverified binaries in the app directory
+    found = shutil.which("7z") or shutil.which("unrar")
+    if found:
+        if found.lower().endswith("7z.exe"):
+            rarfile.UNRAR_TOOL = found
+            rarfile.ALT_TOOL = found
+        else:
+            rarfile.UNRAR_TOOL = found
+        return found
+
+    # 2. Inspect standard system installation locations only
+    standard_paths = [
+        os.path.expandvars(r"%ProgramFiles%\7-Zip\7z.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\7-Zip\7z.exe"),
+        os.path.expandvars(r"%ProgramFiles%\WinRAR\UnRAR.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\WinRAR\UnRAR.exe"),
     ]
-    for path in candidates:
+    for path in standard_paths:
         if os.path.isfile(path):
             if path.lower().endswith("7z.exe"):
                 rarfile.UNRAR_TOOL = path
@@ -66,6 +73,7 @@ def setup_rar_tool():
                 rarfile.UNRAR_TOOL = path
             return path
     return None
+
 
 CONFIGURED_RAR_TOOL = setup_rar_tool()
 IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.bmp', '.gif'}
@@ -76,7 +84,6 @@ def natural_key(text):
 
 
 def draw_x_pixmap(color_hex: str, size: int = 24, stroke: float = 2.1) -> QPixmap:
-    """Draws a crisp X pixmap with padding."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
@@ -92,7 +99,6 @@ def draw_x_pixmap(color_hex: str, size: int = 24, stroke: float = 2.1) -> QPixma
 
 
 def draw_sun_pixmap(color_hex: str, size: int = 24) -> QPixmap:
-    """Draws a vector sun icon with rays."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
@@ -120,7 +126,6 @@ def draw_sun_pixmap(color_hex: str, size: int = 24) -> QPixmap:
 
 
 def draw_moon_pixmap(color_hex: str, size: int = 24) -> QPixmap:
-    """Draws a vector crescent moon icon."""
     pm = QPixmap(size, size)
     pm.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pm)
@@ -289,7 +294,7 @@ class DocumentTabWidget(QWidget):
         if ext == 'cbr' and not CONFIGURED_RAR_TOOL:
             QMessageBox.critical(
                 self, "Missing RAR Tool",
-                "To open .cbr files, install 7-Zip or WinRAR, or place UnRAR.exe next to the application."
+                "To open .cbr files, install 7-Zip or WinRAR on your system."
             )
             return []
 
@@ -386,6 +391,8 @@ class DocumentTabWidget(QWidget):
         self.current_page_idx = index
         self.clear_content_layout()
 
+        # Kept in memory; progress is saved on tab close / app exit to avoid rapid registry operations
+
         if self.window.reading_mode == ComicReader.MODE_CONTINUOUS:
             viewport_w = self.scroll_area.viewport().width()
             viewport_h = self.scroll_area.viewport().height()
@@ -449,7 +456,6 @@ class DocumentTabWidget(QWidget):
             self.clear_content_layout()
             return
 
-        # Suppress painting updates to prevent flicker during container teardown & rebuild
         self.setUpdatesEnabled(False)
         try:
             self.clear_content_layout()
@@ -525,10 +531,16 @@ class DocumentTabWidget(QWidget):
 
     def close_handles(self):
         if self.active_archive:
-            self.active_archive.close()
+            try:
+                self.active_archive.close()
+            except Exception:
+                pass
             self.active_archive = None
         if self.active_pdf:
-            self.active_pdf.close()
+            try:
+                self.active_pdf.close()
+            except Exception:
+                pass
             self.active_pdf = None
         self.current_archive_path = None
 
@@ -574,8 +586,21 @@ class ComicReader(QMainWindow):
         self._apply_theme()
         self.sync_ui_with_tab()
 
-        # Restore past session first, then load the launch file at the rightmost tab
         QTimer.singleShot(0, self._handle_startup_tabs)
+
+    def save_file_progress(self, file_path: str, chapter: int, page: int):
+        if not file_path:
+            return
+        saved_positions = self.settings.value("file_positions", {}, type=dict)
+        saved_positions[os.path.normpath(file_path)] = {
+            "chapter": max(0, chapter),
+            "page": max(0, page)
+        }
+        self.settings.setValue("file_positions", saved_positions)
+
+    def get_file_progress(self, file_path: str):
+        saved_positions = self.settings.value("file_positions", {}, type=dict)
+        return saved_positions.get(os.path.normpath(file_path), {"chapter": 0, "page": 0})
 
     def setup_single_instance_server(self, server_name: str):
         self.local_server = QLocalServer(self)
@@ -696,7 +721,9 @@ class ComicReader(QMainWindow):
         bottom_bar = QHBoxLayout(self.bottom_bar_widget)
         bottom_bar.setContentsMargins(10, 6, 10, 6)
 
-        left_group = QHBoxLayout()
+        left_container = QWidget()
+        left_group = QHBoxLayout(left_container)
+        left_group.setContentsMargins(0, 0, 0, 0)
         left_group.addWidget(QLabel("Zoom:"))
         self.btn_zoom_out = QPushButton("-")
         self.btn_zoom_out.setFixedWidth(30)
@@ -729,14 +756,13 @@ class ComicReader(QMainWindow):
         self.btn_fit_width = QPushButton("Fit W")
         self.btn_fit_width.clicked.connect(self.set_fit_width)
         left_group.addWidget(self.btn_fit_width)
-
-        bottom_bar.addLayout(left_group)
-        bottom_bar.addStretch(1)
+        left_group.addStretch()
 
         self.center_page_group = QWidget()
         center_layout = QHBoxLayout(self.center_page_group)
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(4)
+        center_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         self.btn_prev_pg = QPushButton("◀ Prev Page")
         self.btn_prev_pg.clicked.connect(self.prev_page)
@@ -761,11 +787,11 @@ class ComicReader(QMainWindow):
         self.btn_next_pg.clicked.connect(self.next_page)
         center_layout.addWidget(self.btn_next_pg)
 
-        bottom_bar.addWidget(self.center_page_group)
-        bottom_bar.addStretch(1)
-
-        right_group = QHBoxLayout()
+        right_container = QWidget()
+        right_group = QHBoxLayout(right_container)
+        right_group.setContentsMargins(0, 0, 0, 0)
         right_group.setSpacing(8)
+        right_group.addStretch()
 
         self.scope_combo = QComboBox()
         self.scope_combo.addItems([self.SCOPE_CHAPTER, self.SCOPE_MANGA])
@@ -781,7 +807,9 @@ class ComicReader(QMainWindow):
         self.progress_bar.setAlignment(Qt.AlignmentFlag.AlignCenter)
         right_group.addWidget(self.progress_bar)
 
-        bottom_bar.addLayout(right_group)
+        bottom_bar.addWidget(left_container, 1)
+        bottom_bar.addWidget(self.center_page_group, 0, Qt.AlignmentFlag.AlignCenter)
+        bottom_bar.addWidget(right_container, 1)
         main_layout.addWidget(self.bottom_bar_widget)
 
         for w in [self.btn_open_file, self.recent_combo, self.btn_theme, self.btn_fullscreen,
@@ -891,14 +919,12 @@ class ComicReader(QMainWindow):
 
     def _on_tab_changed(self, index):
         if 0 <= index < self.stack_widget.count():
-            # Freeze widget painting updates during tab transition
             self.stack_widget.setUpdatesEnabled(False)
             self.stack_widget.setCurrentIndex(index)
             self.stack_widget.setUpdatesEnabled(True)
 
             tab = self.current_tab()
             if tab and self.reading_mode != self.MODE_CONTINUOUS:
-                # Render only when views haven't been constructed yet
                 if not tab.content_layout.count() and tab.active_pixmaps:
                     tab.render_current_views()
 
@@ -942,11 +968,12 @@ class ComicReader(QMainWindow):
         if not (0 <= index < self.tab_bar.count()):
             return
 
-        # Suppress intermediate signals so switching happens cleanly once
         self.tab_bar.blockSignals(True)
         try:
             widget = self.stack_widget.widget(index)
             if isinstance(widget, DocumentTabWidget):
+                # Save progress safely at tab closing point
+                self.save_file_progress(widget.file_path, widget.current_chapter_idx, widget.current_page_idx)
                 widget.close_handles()
                 self.stack_widget.removeWidget(widget)
                 widget.deleteLater()
@@ -1457,11 +1484,16 @@ class ComicReader(QMainWindow):
         for path in file_paths:
             self.open_single_file(path)
 
-    def open_single_file(self, file_path, target_ch=0, target_pg=0):
+    def open_single_file(self, file_path, target_ch=None, target_pg=None):
         if not os.path.isfile(file_path):
             return
 
         normalized_path = os.path.normpath(file_path)
+
+        if target_ch is None or target_pg is None:
+            saved = self.get_file_progress(normalized_path)
+            target_ch = saved.get("chapter", 0)
+            target_pg = saved.get("page", 0)
 
         for idx in range(self.stack_widget.count()):
             widget = self.stack_widget.widget(idx)
@@ -1682,7 +1714,6 @@ class ComicReader(QMainWindow):
         saved_tabs = self.settings.value("session_tabs", [], type=list)
         active_tab_idx = self.settings.value("session_active_tab", 0, type=int)
 
-        # 1. Restore previous tabs from session first
         if isinstance(saved_tabs, list) and saved_tabs:
             for item in saved_tabs:
                 if isinstance(item, dict):
@@ -1696,7 +1727,6 @@ class ComicReader(QMainWindow):
                 self.tab_bar.setCurrentIndex(active_tab_idx)
                 self._update_tab_close_icons()
 
-        # 2. If an initial file was double-clicked, open it at the end and activate it
         if self.initial_file:
             self.open_single_file(self.initial_file)
             target_idx = -1
@@ -1715,6 +1745,7 @@ class ComicReader(QMainWindow):
         for idx in range(self.stack_widget.count()):
             widget = self.stack_widget.widget(idx)
             if isinstance(widget, DocumentTabWidget):
+                self.save_file_progress(widget.file_path, widget.current_chapter_idx, widget.current_page_idx)
                 session_tabs.append({
                     "path": widget.file_path,
                     "chapter": widget.current_chapter_idx,
@@ -1734,7 +1765,6 @@ class ComicReader(QMainWindow):
 if __name__ == "__main__":
     SERVER_NAME = "ComicReader_SingleInstance_IPC_Socket"
 
-    # Set distinct AppUserModelID so Windows 11 binds taskbar items to app.ico
     if sys.platform == "win32":
         myappid = "trietc.comicreader.app.1.0"
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(myappid)
@@ -1744,12 +1774,10 @@ if __name__ == "__main__":
     )
     app = QApplication(sys.argv)
 
-    # 1. Attempt to connect to an existing running instance
     client_socket = QLocalSocket()
     client_socket.connectToServer(SERVER_NAME)
 
     if client_socket.waitForConnected(500):
-        # Already running: pass file path argument and exit
         if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
             file_path = os.path.abspath(sys.argv[1])
             client_socket.write(file_path.encode("utf-8"))
@@ -1757,13 +1785,11 @@ if __name__ == "__main__":
         client_socket.disconnectFromServer()
         sys.exit(0)
 
-    # 2. Main instance: configure application icon
     base_path = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     app_icon_path = os.path.join(base_path, "icons", "app.ico")
     if os.path.isfile(app_icon_path):
         app.setWindowIcon(QIcon(app_icon_path))
 
-    # Pass command-line file to constructor for managed startup sequence
     launch_file = sys.argv[1] if (len(sys.argv) > 1 and os.path.isfile(sys.argv[1])) else None
 
     reader = ComicReader(initial_file=launch_file)
